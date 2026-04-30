@@ -87,8 +87,11 @@ async function downloadYouTubeVideo(url: string, outputPath: string): Promise<vo
 
   await ytdlp(url, {
     output: outputTemplate,
-    format: "best[ext=mp4]/best",
+    // ios client: no JS runtime needed, bypasses bot checks without cookies
+    format: "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
     noPlaylist: true,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ...({ extractorArgs: "youtube:player_client=ios" } as any),
     ...(process.env.YTDLP_COOKIES_BROWSER
       ? { cookiesFromBrowser: process.env.YTDLP_COOKIES_BROWSER }
       : {}),
@@ -276,6 +279,8 @@ export const processVideoJob = inngest.createFunction(
         const info = await ytdlp(youtubeUrl, {
           dumpSingleJson: true,
           noWarnings: true,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ...({ extractorArgs: "youtube:player_client=ios" } as any),
         }) as { duration: number };
         const duration = info.duration ?? 600;
         const hl = await selectHighlights(segs, duration);
