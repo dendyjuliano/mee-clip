@@ -62,11 +62,15 @@ async function updateJobStatus(
     .eq("id", jobId);
 }
 
+const NETSCAPE_HEADER = "# Netscape HTTP Cookie File\n";
+
 function resolveCookiesPath(): string | undefined {
   // Priority 1: base64 env var (Vercel) — decode to /tmp
   if (process.env.YTDLP_COOKIES_BASE64) {
     const tmpCookies = path.join(os.tmpdir(), "yt-cookies.txt");
-    fs.writeFileSync(tmpCookies, Buffer.from(process.env.YTDLP_COOKIES_BASE64, "base64"));
+    let content = Buffer.from(process.env.YTDLP_COOKIES_BASE64, "base64").toString("utf8");
+    if (!content.startsWith("# Netscape")) content = NETSCAPE_HEADER + content;
+    fs.writeFileSync(tmpCookies, content);
     return tmpCookies;
   }
   // Priority 2: local file path (dev)
