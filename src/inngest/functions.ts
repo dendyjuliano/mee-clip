@@ -43,13 +43,32 @@ async function updateJobStatus(
     .eq("id", jobId);
 }
 
+function resolveCookiesPath(): string | undefined {
+  // Priority 1: base64 env var (Vercel) — decode to /tmp
+  if (process.env.YTDLP_COOKIES_BASE64) {
+    const tmpCookies = path.join(os.tmpdir(), "yt-cookies.txt");
+    fs.writeFileSync(tmpCookies, Buffer.from(process.env.YTDLP_COOKIES_BASE64, "base64"));
+    return tmpCookies;
+  }
+  // Priority 2: local file path (dev)
+  if (process.env.YTDLP_COOKIES_FILE && fs.existsSync(process.env.YTDLP_COOKIES_FILE)) {
+    return process.env.YTDLP_COOKIES_FILE;
+  }
+  return undefined;
+}
+
 async function downloadYouTubeVideo(url: string, outputPath: string): Promise<void> {
   const outputTemplate = outputPath.replace(/\.[^.]+$/, ".%(ext)s");
+  const cookiesPath = resolveCookiesPath();
 
   await youtubeDl(url, {
     output: outputTemplate,
     format: "best[ext=mp4]/best",
     noPlaylist: true,
+    ...(process.env.YTDLP_COOKIES_BROWSER
+      ? { cookiesFromBrowser: process.env.YTDLP_COOKIES_BROWSER }
+      : {}),
+    ...(cookiesPath ? { cookies: cookiesPath } : {}),
   });
 
   const dir = path.dirname(outputPath);
@@ -69,6 +88,9 @@ async function extractAudio(videoPath: string, audioPath: string): Promise<void>
     ffmpeg(videoPath)
       .output(audioPath)
       .audioCodec("libmp3lame")
+      .audioBitrate("32k")   // low bitrate to stay under Groq's 25MB limit
+      .audioChannels(1)       // mono
+      .audioFrequency(16000)  // 16kHz is enough for speech recognition
       .noVideo()
       .on("end", () => resolve())
       .on("error", reject)
@@ -88,6 +110,9 @@ async function transcribeAudio(audioPath: string): Promise<TranscriptSegment[]> 
   return result.segments || [];
 }
 
+const MIN_CLIP_DURATION = 30;
+const MAX_CLIP_DURATION = 90;
+
 async function selectHighlights(
   segments: TranscriptSegment[],
   videoDuration: number
@@ -101,12 +126,17 @@ async function selectHighlights(
     messages: [
       {
         role: "system",
-        content:
-          "You are a video editor expert. Analyze transcripts and select the most engaging, shareable moments for short-form video clips (30-90 seconds each). Return JSON only.",
+        content: "You are a video editor expert. Select engaging highlight clips from transcripts for short-form social media. Return JSON only.",
       },
       {
         role: "user",
-        content: `Video transcript (total duration: ${videoDuration}s):\n\n${transcript}\n\nSelect 3-5 best highlight clips. Each clip should be 30-90 seconds and contain a complete, engaging thought or moment.\n\nRespond with JSON array: [{"start": number, "end": number, "title": "short descriptive title"}]`,
+        content: `Video transcript (total duration: ${videoDuration}s):\n\n${transcript}\n\n` +
+          `Select 3-5 highlight clips. IMPORTANT RULES:\n` +
+          `- Each clip MUST be between ${MIN_CLIP_DURATION} and ${MAX_CLIP_DURATION} seconds long (end - start >= ${MIN_CLIP_DURATION})\n` +
+          `- Pick a start time, then set end = start + 45 to 90 seconds\n` +
+          `- Choose moments with engaging speech, insights, or interesting stories\n` +
+          `- Clips should not overlap\n\n` +
+          `Respond with this exact JSON: {"clips": [{"start": number, "end": number, "title": "short title"}]}`,
       },
     ],
     response_format: { type: "json_object" },
@@ -114,7 +144,23 @@ async function selectHighlights(
 
   const content = response.choices[0].message.content || "{}";
   const parsed = JSON.parse(content);
-  return parsed.clips || parsed.highlights || [];
+  const raw: Array<{ start: number; end: number; title: string }> =
+    parsed.clips || parsed.highlights || [];
+
+  // Enforce minimum duration regardless of what AI returned
+  return raw.map((clip) => {
+    const duration = clip.end - clip.start;
+    if (duration < MIN_CLIP_DURATION) {
+      return {
+        ...clip,
+        end: Math.min(clip.start + MIN_CLIP_DURATION, videoDuration),
+      };
+    }
+    if (duration > MAX_CLIP_DURATION) {
+      return { ...clip, end: clip.start + MAX_CLIP_DURATION };
+    }
+    return clip;
+  });
 }
 
 async function renderClipWithSubtitles(
@@ -128,32 +174,50 @@ async function renderClipWithSubtitles(
     (s) => s.start >= startTime && s.end <= endTime
   );
 
-  const srtPath = outputPath.replace(".mp4", ".srt");
-  let srtContent = "";
-  clipSegments.forEach((seg, i) => {
-    const toSRT = (t: number) => {
-      const h = Math.floor(t / 3600);
-      const m = Math.floor((t % 3600) / 60);
-      const s = Math.floor(t % 60);
-      const ms = Math.floor((t % 1) * 1000);
-      return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")},${String(ms).padStart(3, "0")}`;
-    };
-    srtContent += `${i + 1}\n${toSRT(seg.start - startTime)} --> ${toSRT(seg.end - startTime)}\n${seg.text.trim()}\n\n`;
+  // Font path: Mac local, fallback to Linux (Vercel/Railway)
+  const fontPath = fs.existsSync("/System/Library/Fonts/Supplemental/Arial.ttf")
+    ? "/System/Library/Fonts/Supplemental/Arial.ttf"
+    : "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+
+  const hasFontFile = fs.existsSync(fontPath);
+
+  // Build drawtext filter — commas inside between() must be escaped as \, for ffmpeg
+  const drawtextFilters = clipSegments.map((seg) => {
+    const relStart = seg.start - startTime;
+    const relEnd = seg.end - startTime;
+    const text = seg.text.trim()
+      .replace(/\\/g, "\\\\")
+      .replace(/’/g, "’")  // replace smart quote to avoid quoting issues
+      .replace(/:/g, "\\:")
+      .replace(/,/g, "\\,")
+      .replace(/\[/g, "\\[")
+      .replace(/\]/g, "\\]");
+    const fontArg = hasFontFile ? `fontfile=${fontPath}:` : "";
+    // Use \, to escape commas inside between() so ffmpeg doesn’t split at them
+    return (
+      `drawtext=${fontArg}text=’${text}’:` +
+      `fontsize=22:fontcolor=white:borderw=2:bordercolor=black:` +
+      `x=(w-text_w)/2:y=h-th-50:` +
+      `enable=between(t\\,${relStart.toFixed(3)}\\,${relEnd.toFixed(3)})`
+    );
   });
 
-  fs.writeFileSync(srtPath, srtContent);
-
   return new Promise((resolve, reject) => {
-    ffmpeg(videoPath)
+    const cmd = ffmpeg(videoPath)
       .seekInput(startTime)
       .duration(endTime - startTime)
-      .videoFilters(`subtitles=${srtPath}:force_style='FontSize=18,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2'`)
-      .output(outputPath)
-      .on("end", () => {
-        fs.unlinkSync(srtPath);
-        resolve();
+      .output(outputPath);
+
+    if (drawtextFilters.length > 0) {
+      // Pass as single string via outputOptions to prevent fluent-ffmpeg comma splitting
+      cmd.outputOptions(["-vf", drawtextFilters.join(",")]);
+    }
+
+    cmd
+      .on("end", () => resolve())
+      .on("error", (err, _stdout, stderr) => {
+        reject(new Error(`ffmpeg error: ${err.message} | stderr: ${stderr}`));
       })
-      .on("error", reject)
       .run();
   });
 }
