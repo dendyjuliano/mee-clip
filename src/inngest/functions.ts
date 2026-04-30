@@ -1,19 +1,38 @@
 import { inngest } from "./client";
 import { supabaseAdmin } from "@/lib/supabase";
 import { uploadVideo } from "@/lib/cloudinary";
-import youtubeDlDefault, { create as createYoutubeDl } from "youtube-dl-exec";
+import { create as createYoutubeDl } from "youtube-dl-exec";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import OpenAI from "openai";
 import Groq from "groq-sdk";
 import fs from "fs";
+import { pipeline } from "stream/promises";
+import { Readable } from "stream";
 import path from "path";
 import os from "os";
 import type { TranscriptSegment } from "@/types";
 
-// Use system yt-dlp (local Mac) or the bundled binary from youtube-dl-exec (Vercel/Linux)
-const ytdlpPath = process.env.YTDLP_PATH || undefined;
-const youtubeDl = ytdlpPath ? createYoutubeDl(ytdlpPath) : youtubeDlDefault;
+const YTDLP_TMP = path.join(os.tmpdir(), "yt-dlp");
+// Standalone Linux binary (no Python required); ~60 MB, cached in /tmp across warm invocations
+const YTDLP_DOWNLOAD_URL =
+  "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux";
+
+async function resolveYtDlpPath(): Promise<string> {
+  // Dev: use the path set in env (e.g. /opt/homebrew/bin/yt-dlp)
+  if (process.env.YTDLP_PATH) return process.env.YTDLP_PATH;
+
+  // Production (Vercel / Linux): download the standalone binary once per Lambda instance
+  if (!fs.existsSync(YTDLP_TMP)) {
+    const res = await fetch(YTDLP_DOWNLOAD_URL, { redirect: "follow" });
+    if (!res.ok || !res.body) throw new Error(`Failed to download yt-dlp: ${res.status}`);
+    const ws = fs.createWriteStream(YTDLP_TMP);
+    await pipeline(Readable.fromWeb(res.body as import("stream/web").ReadableStream), ws);
+    fs.chmodSync(YTDLP_TMP, 0o755);
+  }
+
+  return YTDLP_TMP;
+}
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
@@ -60,8 +79,9 @@ function resolveCookiesPath(): string | undefined {
 async function downloadYouTubeVideo(url: string, outputPath: string): Promise<void> {
   const outputTemplate = outputPath.replace(/\.[^.]+$/, ".%(ext)s");
   const cookiesPath = resolveCookiesPath();
+  const ytdlp = createYoutubeDl(await resolveYtDlpPath());
 
-  await youtubeDl(url, {
+  await ytdlp(url, {
     output: outputTemplate,
     format: "best[ext=mp4]/best",
     noPlaylist: true,
@@ -248,7 +268,8 @@ export const processVideoJob = inngest.createFunction(
         const segs = await transcribeAudio(audioPath);
 
         await updateJobStatus(jobId, "analyzing", 50);
-        const info = await youtubeDl(youtubeUrl, {
+        const ytdlp = createYoutubeDl(await resolveYtDlpPath());
+        const info = await ytdlp(youtubeUrl, {
           dumpSingleJson: true,
           noWarnings: true,
         }) as { duration: number };
