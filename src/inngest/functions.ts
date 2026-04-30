@@ -1,7 +1,7 @@
 import { inngest } from "./client";
 import { supabaseAdmin } from "@/lib/supabase";
 import { uploadVideo } from "@/lib/cloudinary";
-import { create as createYoutubeDl } from "youtube-dl-exec";
+import youtubeDlDefault, { create as createYoutubeDl } from "youtube-dl-exec";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import OpenAI from "openai";
@@ -11,9 +11,9 @@ import path from "path";
 import os from "os";
 import type { TranscriptSegment } from "@/types";
 
-// Use system yt-dlp (local Mac) or the bundled binary (Vercel/Linux)
+// Use system yt-dlp (local Mac) or the bundled binary from youtube-dl-exec (Vercel/Linux)
 const ytdlpPath = process.env.YTDLP_PATH || undefined;
-const youtubeDl = ytdlpPath ? createYoutubeDl(ytdlpPath) : createYoutubeDl("yt-dlp");
+const youtubeDl = ytdlpPath ? createYoutubeDl(ytdlpPath) : youtubeDlDefault;
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
